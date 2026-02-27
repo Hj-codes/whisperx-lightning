@@ -35,8 +35,10 @@ class WhisperXLitAPI(ls.LitAPI):
         os.environ.setdefault("XDG_CACHE_HOME", "/app/models")
         os.environ.setdefault("TRANSFORMERS_CACHE", "/app/models/huggingface")
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/app/models/huggingface/hub")
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        # Keep online access enabled by default so runtime can fetch
+        # uncached alignment models (for example Hindi) on demand.
+        os.environ.setdefault("HF_HUB_OFFLINE", "0")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
 
         import torch
         import whisperx
@@ -47,7 +49,7 @@ class WhisperXLitAPI(ls.LitAPI):
         self._device = device
         self._queue: JobQueue[TranscribeRequest] = JobQueue(max_queue_size=1000)
 
-        self._model_name = "large-v3"
+        self._model_name = "large-v3-turbo"
         self._compute_type = "float16"
         self._model: Any = None
         self._align_cache: dict[tuple[str, str | None], tuple[Any, Any]] = {}

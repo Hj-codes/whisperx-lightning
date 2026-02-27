@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl
 class TranscribeRequest(BaseModel):
     audio_url: HttpUrl
     webhook_url: HttpUrl
-    model: str = Field(default="large-v3")
+    model: str = Field(default="large-v3-turbo")
     language: str | None = Field(default=None)
     batch_size: int = Field(default=4, ge=1, le=64)
     chunk_size: int = Field(default=8, ge=1, le=120)
