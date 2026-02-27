@@ -49,8 +49,10 @@ class WhisperXLitAPI(ls.LitAPI):
         self._device = device
         self._queue: JobQueue[TranscribeRequest] = JobQueue(max_queue_size=1000)
 
-        self._model_name = "large-v3-turbo"
-        self._compute_type = "float16"
+        self._model_name = os.environ.get("WHISPERX_MODEL", "large-v3-turbo")
+        self._compute_type = self._resolve_compute_type(
+            os.environ.get("WHISPERX_COMPUTE_TYPE", "auto")
+        )
         self._model: Any = None
         self._align_cache: dict[tuple[str, str | None], tuple[Any, Any]] = {}
 
@@ -76,16 +78,37 @@ class WhisperXLitAPI(ls.LitAPI):
         except Exception:
             return output
 
+    def _resolve_compute_type(self, requested: str) -> str:
+        normalized = (requested or "").strip().lower()
+        if not normalized or normalized == "auto":
+            return "float16" if str(self._device).startswith("cuda") else "int8"
+        return normalized
+
     def _load_model(self, model_name: str, compute_type: str) -> None:
+        resolved_compute_type = self._resolve_compute_type(compute_type)
         self._model_name = model_name
-        self._compute_type = compute_type
-        self._model = self._whisperx.load_model(
-            model_name,
-            self._device,
-            compute_type=compute_type,
-            language=None,
-            task="transcribe",
-        )
+        self._compute_type = resolved_compute_type
+        try:
+            self._model = self._whisperx.load_model(
+                model_name,
+                self._device,
+                compute_type=resolved_compute_type,
+                language=None,
+                task="transcribe",
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "do not support efficient float16 computation" not in msg:
+                raise
+            fallback_compute_type = "int8_float16" if str(self._device).startswith("cuda") else "int8"
+            self._model = self._whisperx.load_model(
+                model_name,
+                self._device,
+                compute_type=fallback_compute_type,
+                language=None,
+                task="transcribe",
+            )
+            self._compute_type = fallback_compute_type
 
     def _get_align_bundle(self, *, language: str, align_model: str | None) -> tuple[Any, Any]:
         key = (language, align_model)

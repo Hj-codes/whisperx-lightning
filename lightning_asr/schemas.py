@@ -12,7 +12,7 @@ class TranscribeRequest(BaseModel):
     language: str | None = Field(default=None)
     batch_size: int = Field(default=4, ge=1, le=64)
     chunk_size: int = Field(default=8, ge=1, le=120)
-    compute_type: str = Field(default="float16")
+    compute_type: str = Field(default="auto")
     align_model: str | None = Field(default=None)
     return_word_timestamps: bool = Field(default=True)
 
