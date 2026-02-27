@@ -7,6 +7,7 @@ from contextlib import suppress
 from typing import Any
 
 import httpx
+import litserve as ls
 
 from lightning_asr.job_queue import Job, JobQueue
 from lightning_asr.schemas import TranscribeRequest
@@ -27,7 +28,7 @@ def _register_torch_safe_globals(torch_module: Any) -> None:
         return
 
 
-class WhisperXLitAPI:
+class WhisperXLitAPI(ls.LitAPI):
     def setup(self, device: str) -> None:
         os.environ.setdefault("HF_HOME", "/app/models/huggingface")
         os.environ.setdefault("TORCH_HOME", "/app/models/torch")
@@ -175,8 +176,6 @@ class WhisperXLitAPI:
 
 
 def build_server() -> Any:
-    import litserve as ls
-
     api = WhisperXLitAPI()
     return ls.LitServer(api, accelerator="auto")
 
