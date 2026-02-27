@@ -5,15 +5,18 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
-class Job[T]:
+class Job(Generic[T]):
     job_id: str
     payload: T
 
 
-class JobQueue[T]:
+class JobQueue(Generic[T]):
     def __init__(self, *, max_queue_size: int = 1000) -> None:
         self._q: queue.Queue[Job[T]] = queue.Queue(maxsize=max_queue_size)
         self._thread: threading.Thread | None = None

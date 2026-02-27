@@ -1,0 +1,7 @@
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep pyupgrade checks, but disable PEP 695-only generic suggestion
+# because runtime image uses Python 3.10.
+ignore = ["UP046"]
