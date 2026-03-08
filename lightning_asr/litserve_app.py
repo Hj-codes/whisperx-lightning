@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import time
 from contextlib import suppress
@@ -10,11 +11,13 @@ import httpx
 import litserve as ls
 
 from lightning_asr.job_queue import Job, JobQueue
+from lightning_asr.logging_utils import get_logger, log_event
 from lightning_asr.schemas import TranscribeRequest
 from lightning_asr.url_io import download_url_to_tempfile
-from lightning_asr.webhook import post_webhook_json
+from lightning_asr.webhook import post_webhook_json, validate_webhook_url
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "8"))
+logger = get_logger(__name__)
 
 
 def _register_torch_safe_globals(torch_module: Any) -> None:
@@ -30,6 +33,15 @@ def _register_torch_safe_globals(torch_module: Any) -> None:
 
 class WhisperXLitAPI(ls.LitAPI):
     def setup(self, device: str) -> None:
+        self._is_ready = False
+        self._queue_started = False
+        log_event(
+            logger,
+            logging.INFO,
+            "setup_started",
+            "Initializing Lightning WhisperX service",
+            device=device,
+        )
         os.environ.setdefault("HF_HOME", "/app/models/huggingface")
         os.environ.setdefault("TORCH_HOME", "/app/models/torch")
         os.environ.setdefault("XDG_CACHE_HOME", "/app/models")
@@ -57,7 +69,19 @@ class WhisperXLitAPI(ls.LitAPI):
         self._align_cache: dict[tuple[str, str | None], tuple[Any, Any]] = {}
 
         self._load_model(self._model_name, self._compute_type)
+        self._warmup_model()
         self._queue.start(processor=self._process_job)
+        self._queue_started = True
+        self._is_ready = True
+        log_event(
+            logger,
+            logging.INFO,
+            "setup_completed",
+            "Lightning WhisperX service is ready",
+            device=device,
+            model=self._model_name,
+            compute_type=self._compute_type,
+        )
 
     def decode_request(self, request: Any) -> TranscribeRequest:
         if isinstance(request, dict):
@@ -68,6 +92,19 @@ class WhisperXLitAPI(ls.LitAPI):
 
     def predict(self, request: TranscribeRequest) -> dict[str, Any]:
         job_id = self._queue.submit(request)
+        queue_size = None
+        with suppress(Exception):
+            queue_size = self._queue._q.qsize()
+        log_event(
+            logger,
+            logging.INFO,
+            "job_accepted",
+            "Accepted Lightning transcription job",
+            job_id=job_id,
+            language=request.language,
+            model=request.model,
+            queue_size=queue_size,
+        )
         return {"job_id": job_id, "status": "accepted"}
 
     def encode_response(self, output: dict[str, Any]) -> Any:
@@ -85,6 +122,7 @@ class WhisperXLitAPI(ls.LitAPI):
         return normalized
 
     def _load_model(self, model_name: str, compute_type: str) -> None:
+        started = time.perf_counter()
         resolved_compute_type = self._resolve_compute_type(compute_type)
         self._model_name = model_name
         self._compute_type = resolved_compute_type
@@ -95,6 +133,16 @@ class WhisperXLitAPI(ls.LitAPI):
                 compute_type=resolved_compute_type,
                 language=None,
                 task="transcribe",
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "model_loaded",
+                "Loaded WhisperX model",
+                model=model_name,
+                device=self._device,
+                compute_type=self._compute_type,
+                duration_seconds=round(time.perf_counter() - started, 4),
             )
         except ValueError as exc:
             msg = str(exc)
@@ -109,6 +157,79 @@ class WhisperXLitAPI(ls.LitAPI):
                 task="transcribe",
             )
             self._compute_type = fallback_compute_type
+            log_event(
+                logger,
+                logging.WARNING,
+                "model_loaded_with_fallback",
+                "Loaded WhisperX model with fallback compute type",
+                model=model_name,
+                device=self._device,
+                requested_compute_type=resolved_compute_type,
+                compute_type=self._compute_type,
+                duration_seconds=round(time.perf_counter() - started, 4),
+            )
+
+    def _warmup_model(self) -> None:
+        try:
+            import numpy as np
+
+            started = time.perf_counter()
+            dummy_audio = np.zeros(16000, dtype="float32")
+            self._model.transcribe(audio=dummy_audio, batch_size=1, chunk_size=1, language="en")
+            log_event(
+                logger,
+                logging.INFO,
+                "model_warmed",
+                "Completed WhisperX model warmup",
+                model=self._model_name,
+                compute_type=self._compute_type,
+                duration_seconds=round(time.perf_counter() - started, 4),
+            )
+        except Exception:
+            logger.exception(
+                "WhisperX model warmup failed",
+                extra={
+                    "event": "model_warmup_failed",
+                    "fields": {
+                        "model": self._model_name,
+                        "compute_type": self._compute_type,
+                    },
+                },
+            )
+
+    def health(self) -> bool:
+        queue_thread = getattr(self._queue, "_thread", None)
+        return bool(
+            self._is_ready
+            and self._model is not None
+            and self._queue_started
+            and queue_thread is not None
+            and queue_thread.is_alive()
+        )
+
+    def _build_transcribe_kwargs(self, req: TranscribeRequest) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "batch_size": req.batch_size,
+            "chunk_size": req.chunk_size if req.chunk_size else CHUNK_SIZE,
+            "language": req.language,
+        }
+        for key in [
+            "beam_size",
+            "best_of",
+            "patience",
+            "length_penalty",
+            "temperatures",
+            "compression_ratio_threshold",
+            "log_prob_threshold",
+            "no_speech_threshold",
+            "initial_prompt",
+            "vad_onset",
+            "vad_offset",
+        ]:
+            value = getattr(req, key)
+            if value is not None:
+                kwargs[key] = value
+        return kwargs
 
     def _get_align_bundle(self, *, language: str, align_model: str | None) -> tuple[Any, Any]:
         key = (language, align_model)
@@ -123,24 +244,64 @@ class WhisperXLitAPI(ls.LitAPI):
     def _process_job(self, job: Job[TranscribeRequest]) -> None:
         started = time.perf_counter()
         req = job.payload
+        audio = None
+        transcript = None
+        aligned = None
+        download_seconds: float | None = None
+        transcription_seconds: float | None = None
+        alignment_seconds: float | None = None
         payload_base = {
             "job_id": job.job_id,
             "model": req.model,
             "language": req.language,
         }
+        log_event(
+            logger,
+            logging.INFO,
+            "job_started",
+            "Processing Lightning transcription job",
+            job_id=job.job_id,
+            audio_url=str(req.audio_url),
+            model=req.model,
+            language=req.language,
+        )
         try:
+            validate_webhook_url(str(req.webhook_url))
             if req.model != self._model_name or req.compute_type != self._compute_type:
                 self._load_model(req.model, req.compute_type)
+                self._warmup_model()
 
+            download_started = time.perf_counter()
             with download_url_to_tempfile(url=str(req.audio_url), suffix=".audio") as audio_path:
+                audio_bytes = audio_path.stat().st_size
                 audio = self._whisperx.load_audio(str(audio_path))
-            transcript = self._model.transcribe(
-                audio=audio,
-                batch_size=req.batch_size,
-                chunk_size=req.chunk_size if req.chunk_size else CHUNK_SIZE,
-                language=req.language,
+            download_seconds = round(time.perf_counter() - download_started, 4)
+            log_event(
+                logger,
+                logging.INFO,
+                "audio_downloaded",
+                "Downloaded audio input for transcription",
+                job_id=job.job_id,
+                audio_bytes=audio_bytes,
+                duration_seconds=download_seconds,
             )
+
+            transcription_started = time.perf_counter()
+            transcript = self._model.transcribe(audio=audio, **self._build_transcribe_kwargs(req))
+            transcription_seconds = round(time.perf_counter() - transcription_started, 4)
             lang = str(transcript.get("language") or req.language or "en")
+            log_event(
+                logger,
+                logging.INFO,
+                "transcription_completed",
+                "Completed WhisperX transcription",
+                job_id=job.job_id,
+                detected_language=lang,
+                segment_count=len(transcript.get("segments", [])),
+                duration_seconds=transcription_seconds,
+            )
+
+            alignment_started = time.perf_counter()
             (align_model, align_meta) = self._get_align_bundle(
                 language=lang, align_model=req.align_model
             )
@@ -151,8 +312,9 @@ class WhisperXLitAPI(ls.LitAPI):
                 audio,
                 self._device,
                 interpolate_method="nearest",
-                return_char_alignments=False,
+                return_char_alignments=req.return_char_alignments,
             )
+            alignment_seconds = round(time.perf_counter() - alignment_started, 4)
 
             segments = aligned.get("segments", [])
             words = None
@@ -164,7 +326,24 @@ class WhisperXLitAPI(ls.LitAPI):
                             flat.append(w)
                 words = flat
 
-            timings = {"total_seconds": round(time.perf_counter() - started, 4)}
+            total_seconds = round(time.perf_counter() - started, 4)
+            timings = {
+                "download_seconds": download_seconds,
+                "transcription_seconds": transcription_seconds,
+                "alignment_seconds": alignment_seconds,
+                "total_seconds": total_seconds,
+            }
+            log_event(
+                logger,
+                logging.INFO,
+                "alignment_completed",
+                "Completed WhisperX alignment",
+                job_id=job.job_id,
+                language=aligned.get("language", lang),
+                segment_count=len(segments),
+                word_count=len(words) if words is not None else 0,
+                duration_seconds=alignment_seconds,
+            )
             post_webhook_json(
                 webhook_url=str(req.webhook_url),
                 payload={
@@ -176,10 +355,32 @@ class WhisperXLitAPI(ls.LitAPI):
                     "timings": timings,
                 },
             )
+            log_event(
+                logger,
+                logging.INFO,
+                "job_completed",
+                "Lightning transcription job completed",
+                job_id=job.job_id,
+                total_seconds=total_seconds,
+                segment_count=len(segments),
+            )
         except Exception as exc:
             safe_error = str(exc)
             if isinstance(exc, httpx.HTTPError):
                 safe_error = f"HTTP error: {exc}"
+            logger.exception(
+                "Lightning transcription job failed",
+                extra={
+                    "event": "job_failed",
+                    "fields": {
+                        "job_id": job.job_id,
+                        "audio_url": str(req.audio_url),
+                        "model": req.model,
+                        "language": req.language,
+                        "error": safe_error,
+                    },
+                },
+            )
             with suppress(Exception):
                 post_webhook_json(
                     webhook_url=str(req.webhook_url),

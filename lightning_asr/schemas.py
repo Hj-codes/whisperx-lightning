@@ -15,6 +15,18 @@ class TranscribeRequest(BaseModel):
     compute_type: str = Field(default="auto")
     align_model: str | None = Field(default=None)
     return_word_timestamps: bool = Field(default=True)
+    beam_size: int | None = Field(default=None, ge=1, le=64)
+    best_of: int | None = Field(default=None, ge=1, le=64)
+    patience: float | None = Field(default=None, ge=0.0)
+    length_penalty: float | None = Field(default=None)
+    temperatures: float | list[float] | None = Field(default=None)
+    compression_ratio_threshold: float | None = Field(default=None)
+    log_prob_threshold: float | None = Field(default=None)
+    no_speech_threshold: float | None = Field(default=None)
+    initial_prompt: str | None = Field(default=None)
+    vad_onset: float | None = Field(default=None)
+    vad_offset: float | None = Field(default=None)
+    return_char_alignments: bool = Field(default=False)
 
 
 class AcceptedResponse(BaseModel):
