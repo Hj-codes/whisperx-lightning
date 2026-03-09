@@ -139,6 +139,8 @@ class WhisperXLitAPI(ls.LitAPI):
         )
         self._model: Any = None
         self._align_cache: dict[tuple[str, str | None], tuple[Any, Any]] = {}
+        self._asr_options_signature: tuple[tuple[str, Any], ...] = ()
+        self._vad_options_signature: tuple[tuple[str, Any], ...] = ()
 
         self._load_model(self._model_name, self._compute_type)
         self._warmup_model()
@@ -156,10 +158,17 @@ class WhisperXLitAPI(ls.LitAPI):
         )
 
     def decode_request(self, request: Any) -> TranscribeRequest:
+        if isinstance(request, str):
+            return TranscribeRequest.model_validate_json(request)
+        if isinstance(request, bytes):
+            return TranscribeRequest.model_validate_json(request.decode("utf-8"))
         if isinstance(request, dict):
             return TranscribeRequest.model_validate(request)
         if hasattr(request, "json"):
-            return TranscribeRequest.model_validate(request.json())
+            parsed = request.json()
+            if isinstance(parsed, str):
+                return TranscribeRequest.model_validate_json(parsed)
+            return TranscribeRequest.model_validate(parsed)
         return TranscribeRequest.model_validate(request)
 
     def predict(self, request: TranscribeRequest) -> dict[str, Any]:
@@ -193,9 +202,18 @@ class WhisperXLitAPI(ls.LitAPI):
             return "float16" if str(self._device).startswith("cuda") else "int8"
         return normalized
 
-    def _load_model(self, model_name: str, compute_type: str) -> None:
+    def _load_model(
+        self,
+        model_name: str,
+        compute_type: str,
+        *,
+        asr_options: dict[str, Any] | None = None,
+        vad_options: dict[str, Any] | None = None,
+    ) -> None:
         started = time.perf_counter()
         resolved_compute_type = self._resolve_compute_type(compute_type)
+        resolved_asr_options = asr_options or {}
+        resolved_vad_options = vad_options or {}
         self._model_name = model_name
         self._compute_type = resolved_compute_type
         try:
@@ -203,9 +221,13 @@ class WhisperXLitAPI(ls.LitAPI):
                 model_name,
                 self._whisperx_device,
                 compute_type=resolved_compute_type,
+                asr_options=resolved_asr_options or None,
                 language=None,
                 task="transcribe",
+                vad_options=resolved_vad_options or None,
             )
+            self._asr_options_signature = self._options_signature(resolved_asr_options)
+            self._vad_options_signature = self._options_signature(resolved_vad_options)
             log_event(
                 logger,
                 logging.INFO,
@@ -225,10 +247,14 @@ class WhisperXLitAPI(ls.LitAPI):
                 model_name,
                 self._whisperx_device,
                 compute_type=fallback_compute_type,
+                asr_options=resolved_asr_options or None,
                 language=None,
                 task="transcribe",
+                vad_options=resolved_vad_options or None,
             )
             self._compute_type = fallback_compute_type
+            self._asr_options_signature = self._options_signature(resolved_asr_options)
+            self._vad_options_signature = self._options_signature(resolved_vad_options)
             log_event(
                 logger,
                 logging.WARNING,
@@ -270,21 +296,19 @@ class WhisperXLitAPI(ls.LitAPI):
             )
 
     def health(self) -> bool:
-        queue_thread = getattr(self._queue, "_thread", None)
-        return bool(
-            self._is_ready
-            and self._model is not None
-            and self._queue_started
-            and queue_thread is not None
-            and queue_thread.is_alive()
-        )
+        return super().health()
 
-    def _build_transcribe_kwargs(self, req: TranscribeRequest) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "batch_size": req.batch_size,
-            "chunk_size": req.chunk_size if req.chunk_size else CHUNK_SIZE,
-            "language": req.language,
-        }
+    def _options_signature(self, options: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        normalized: list[tuple[str, Any]] = []
+        for key, value in options.items():
+            if isinstance(value, list):
+                normalized.append((key, tuple(value)))
+            else:
+                normalized.append((key, value))
+        return tuple(sorted(normalized))
+
+    def _build_asr_options(self, req: TranscribeRequest) -> dict[str, Any]:
+        options: dict[str, Any] = {}
         for key in [
             "beam_size",
             "best_of",
@@ -295,12 +319,26 @@ class WhisperXLitAPI(ls.LitAPI):
             "log_prob_threshold",
             "no_speech_threshold",
             "initial_prompt",
-            "vad_onset",
-            "vad_offset",
         ]:
             value = getattr(req, key)
             if value is not None:
-                kwargs[key] = value
+                options[key] = value
+        return options
+
+    def _build_vad_options(self, req: TranscribeRequest) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        if req.vad_onset is not None:
+            options["vad_onset"] = req.vad_onset
+        if req.vad_offset is not None:
+            options["vad_offset"] = req.vad_offset
+        return options
+
+    def _build_transcribe_kwargs(self, req: TranscribeRequest) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "batch_size": req.batch_size,
+            "chunk_size": req.chunk_size if req.chunk_size else CHUNK_SIZE,
+            "language": req.language,
+        }
         return kwargs
 
     def _get_align_bundle(self, *, language: str, align_model: str | None) -> tuple[Any, Any]:
@@ -340,8 +378,22 @@ class WhisperXLitAPI(ls.LitAPI):
         try:
             validate_webhook_url(str(req.webhook_url))
             requested_compute_type = self._resolve_compute_type(req.compute_type)
-            if req.model != self._model_name or requested_compute_type != self._compute_type:
-                self._load_model(req.model, requested_compute_type)
+            requested_asr_options = self._build_asr_options(req)
+            requested_vad_options = self._build_vad_options(req)
+            if (
+                req.model != self._model_name
+                or requested_compute_type != self._compute_type
+                or self._options_signature(requested_asr_options)
+                != self._asr_options_signature
+                or self._options_signature(requested_vad_options)
+                != self._vad_options_signature
+            ):
+                self._load_model(
+                    req.model,
+                    requested_compute_type,
+                    asr_options=requested_asr_options,
+                    vad_options=requested_vad_options,
+                )
                 self._warmup_model()
 
             download_started = time.perf_counter()
