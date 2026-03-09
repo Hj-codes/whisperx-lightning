@@ -28,6 +28,8 @@ The final result is posted to `webhook_url` with either:
 docker build -t whisperx-lightning:local -f lightning_asr/Dockerfile .
 ```
 
+The Docker build now copies `requirements.txt` and the model downloader before the rest of `lightning_asr/`, so ordinary service code changes keep the dependency and model layers cached.
+
 ## Publish flow (GitHub -> GHCR)
 
 1. Push to `main` (or create a version tag like `v1.0.0`).
@@ -58,5 +60,5 @@ Use Lightning dashboard to import your GHCR image directly:
 
 - First build/push/pull can be slow; expect long transfer times.
 - Prefer immutable SHA tags for reproducible deploys.
-- Keep model download layers stable for better build cache reuse.
+- Keep `requirements.txt` and `lightning_asr/download_models.py` stable for better build cache reuse.
 - If cost/latency becomes an issue, follow up with a multi-stage slimming pass.

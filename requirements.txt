@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+litserve==0.2.17
+httpx==0.27.2
+pydantic==2.8.2
+whisperx==3.7.7
+onnxruntime-gpu==1.19.2
