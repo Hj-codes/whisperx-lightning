@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal, cast
 
 import httpx
 import litserve as ls
@@ -29,6 +29,57 @@ def _register_torch_safe_globals(torch_module: Any) -> None:
         torch_module.serialization.add_safe_globals([ListConfig, DictConfig])
     except Exception:
         return
+
+
+def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw_value = str(os.environ.get(name, str(default))).strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {parsed}")
+    return parsed
+
+
+def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw_value = str(os.environ.get(name, str(default))).strip()
+    try:
+        parsed = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw_value!r}") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {parsed}")
+    return parsed
+
+
+def _read_timeout_env(name: str, default: bool | float = False) -> bool | float:
+    raw_value = str(os.environ.get(name, str(default))).strip().lower()
+    if raw_value in {"false", "off", "none"}:
+        return False
+    return _read_float_env(name, 0.0, minimum=0.0)
+
+
+def _read_devices_env(name: str = "LITSERVE_DEVICES") -> int | Literal["auto"]:
+    raw_value = str(os.environ.get(name, "auto")).strip().lower()
+    if raw_value == "auto":
+        return "auto"
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be 'auto' or an integer, got {raw_value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be >= 1, got {parsed}")
+    return parsed
+
+
+def _normalize_whisperx_device(device: str) -> str:
+    normalized = str(device or "").strip().lower()
+    if normalized.startswith("cuda"):
+        # LitServe passes indexed devices like `cuda:0`, but WhisperX/faster-whisper
+        # expects the backend name (`cuda`) and derives the visible GPU itself.
+        return "cuda"
+    return normalized or "cpu"
 
 
 class WhisperXLitAPI(ls.LitAPI):
@@ -58,7 +109,28 @@ class WhisperXLitAPI(ls.LitAPI):
         self._torch: Any = torch
         self._whisperx: Any = whisperx
         _register_torch_safe_globals(torch)
+        cuda_available = torch.cuda.is_available()
+        cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+        cuda_version = torch.version.cuda if cuda_available else None
+        log_event(
+            logger,
+            logging.INFO,
+            "gpu_diagnostics",
+            "Resolved GPU runtime information",
+            device=device,
+            cuda_available=cuda_available,
+            cuda_device_count=cuda_device_count,
+            cuda_version=cuda_version,
+            torch_version=torch.__version__,
+        )
+        if not str(device).startswith("cuda") and cuda_available:
+            logger.warning(
+                "LitServe selected device '%s' even though CUDA is available; "
+                "check LITSERVE_ACCELERATOR/LITSERVE_DEVICES and deployment GPU assignment.",
+                device,
+            )
         self._device = device
+        self._whisperx_device = _normalize_whisperx_device(device)
         self._queue: JobQueue[TranscribeRequest] = JobQueue(max_queue_size=1000)
 
         self._model_name = os.environ.get("WHISPERX_MODEL", "large-v3-turbo")
@@ -129,7 +201,7 @@ class WhisperXLitAPI(ls.LitAPI):
         try:
             self._model = self._whisperx.load_model(
                 model_name,
-                self._device,
+                self._whisperx_device,
                 compute_type=resolved_compute_type,
                 language=None,
                 task="transcribe",
@@ -151,7 +223,7 @@ class WhisperXLitAPI(ls.LitAPI):
             fallback_compute_type = "int8_float16" if str(self._device).startswith("cuda") else "int8"
             self._model = self._whisperx.load_model(
                 model_name,
-                self._device,
+                self._whisperx_device,
                 compute_type=fallback_compute_type,
                 language=None,
                 task="transcribe",
@@ -236,7 +308,7 @@ class WhisperXLitAPI(ls.LitAPI):
         if key in self._align_cache:
             return self._align_cache[key]
         bundle = self._whisperx.load_align_model(
-            language_code=language, device=self._device, model_name=align_model
+            language_code=language, device=self._whisperx_device, model_name=align_model
         )
         self._align_cache[key] = bundle
         return bundle
@@ -267,8 +339,9 @@ class WhisperXLitAPI(ls.LitAPI):
         )
         try:
             validate_webhook_url(str(req.webhook_url))
-            if req.model != self._model_name or req.compute_type != self._compute_type:
-                self._load_model(req.model, req.compute_type)
+            requested_compute_type = self._resolve_compute_type(req.compute_type)
+            if req.model != self._model_name or requested_compute_type != self._compute_type:
+                self._load_model(req.model, requested_compute_type)
                 self._warmup_model()
 
             download_started = time.perf_counter()
@@ -310,7 +383,7 @@ class WhisperXLitAPI(ls.LitAPI):
                 align_model,
                 align_meta,
                 audio,
-                self._device,
+                self._whisperx_device,
                 interpolate_method="nearest",
                 return_char_alignments=req.return_char_alignments,
             )
@@ -402,8 +475,38 @@ class WhisperXLitAPI(ls.LitAPI):
 
 
 def build_server() -> Any:
-    api = WhisperXLitAPI()
-    return ls.LitServer(api, accelerator="auto")
+    api = WhisperXLitAPI(
+        max_batch_size=_read_int_env("LITSERVE_MAX_BATCH_SIZE", 1, minimum=1),
+        batch_timeout=_read_float_env("LITSERVE_BATCH_TIMEOUT", 0.0, minimum=0.0),
+    )
+    accelerator = cast(
+        Literal["cpu", "cuda", "mps", "auto"],
+        str(os.environ.get("LITSERVE_ACCELERATOR", "cuda")).strip().lower() or "cuda",
+    )
+    devices = _read_devices_env()
+    workers_per_device = _read_int_env("LITSERVE_WORKERS_PER_DEVICE", 1, minimum=1)
+    timeout = _read_timeout_env("LITSERVE_TIMEOUT", False)
+    logger.info(
+        "Configuring LitServe server",
+        extra={
+            "event": "server_configuration",
+            "fields": {
+                "accelerator": accelerator,
+                "devices": devices,
+                "workers_per_device": workers_per_device,
+                "max_batch_size": api.max_batch_size,
+                "batch_timeout": api.batch_timeout,
+                "timeout": timeout,
+            },
+        },
+    )
+    return ls.LitServer(
+        api,
+        accelerator=accelerator,
+        devices=devices,
+        workers_per_device=workers_per_device,
+        timeout=timeout,
+    )
 
 
 if __name__ == "__main__":

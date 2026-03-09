@@ -30,6 +30,41 @@ docker build -t whisperx-lightning:local -f lightning_asr/Dockerfile .
 
 The Docker build now copies `requirements.txt` and the model downloader before the rest of `lightning_asr/`, so ordinary service code changes keep the dependency and model layers cached.
 
+## Local GPU smoke test
+
+From the repository root, start the LitServe container with Docker GPU passthrough:
+
+```bash
+docker compose -f docker-compose.gpu.yml up --build
+```
+
+For a one-off container run:
+
+```bash
+docker run --rm --gpus all -p 8000:8000 whisperx-lightning:local
+```
+
+Startup logs should show:
+
+- `event="gpu_diagnostics"` with `cuda_available=true`
+- `device="cuda"` during setup
+- `compute_type="float16"` during model load
+
+## Runtime configuration
+
+The container defaults to GPU-first LitServe settings. Override these env vars if you need a different deployment shape:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LITSERVE_ACCELERATOR` | `cuda` | LitServe accelerator selection. Use `cuda` for GPU workers and override to `auto` or `cpu` only for debugging. |
+| `LITSERVE_DEVICES` | `auto` | Number of devices LitServe should bind to, or `auto` to let LitServe detect the visible GPUs. |
+| `LITSERVE_WORKERS_PER_DEVICE` | `1` | Worker processes per device. Keep this low for WhisperX because model memory usage is high. |
+| `LITSERVE_MAX_BATCH_SIZE` | `1` | LitServe request batching. The service already batches audio chunks internally, so the external request batch stays at `1`. |
+| `LITSERVE_BATCH_TIMEOUT` | `0.0` | LitServe batch wait in seconds before dispatching a request batch. |
+| `LITSERVE_TIMEOUT` | `false` | Disables LitServe request timeout so long-running transcriptions are accepted cleanly. |
+| `WHISPERX_COMPUTE_TYPE` | `auto` | Defaults to `float16` on CUDA and `int8` on CPU. Set explicitly only when debugging model compatibility. |
+| `WHISPERX_MODEL` | `large-v3-turbo` | Startup model used for warmup. Requests can override it, but staying on one model avoids reload churn. |
+
 ## Publish flow (GitHub -> GHCR)
 
 1. Push to `main` (or create a version tag like `v1.0.0`).
